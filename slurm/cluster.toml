@@ -1,0 +1,136 @@
+# Slurm cluster settings and job definitions, rendered by slurm/generate.py.
+# Put your account in slurm/cluster.local.toml (not committed):  [cluster]  account = "..."
+# Data and weights are fetched on a login node first: bash scripts/download_data.sh
+# Find your Slurm account with:  sacctmgr show assoc format=Account%20,User,QOS | grep $USER
+#
+# Order: export -> ptq -> accuracy, accuracy-gpu -> latency-cpu, latency-gpu -> summary;
+# qat and qat-float-control run in parallel, then export-qat and the accuracy/latency jobs again.
+
+[cluster]
+account = "CHANGE_ME"   # overridden by slurm/cluster.local.toml
+python_module = "Python/3.11.3-GCCcore-12.3.0"   # module spider Python
+venv = "/cluster/work/$USER/venvs/edge-optimization"
+workdir = "/cluster/work/$USER/edge-optimization"   # $DATA = workdir/data, $RUNS = workdir/runs
+mail_user = ""
+
+[cluster.env]
+YOLO_OFFLINE = "1"      # checkpoints are pre-fetched into $RUNS/models by scripts/download_data.sh
+ULTRALYTICS_SKIP_REQUIREMENTS_CHECKS = "1"   # everything is installed by setup_cluster.sh; nodes are offline
+
+[defaults]
+partition = "GPUQ"
+time = "0-02:00:00"
+cpus = 8
+mem = "32G"
+gpus = 1
+constraint = "a100"     # TensorRT engines are built for the GPU they run on: export and timing on the same type
+
+[jobs.export]
+description = "All deployment formats for YOLO26n and YOLO26s (ONNX, INT8 ONNX, OpenVINO, TensorRT FP16/INT8)"
+command = "python -m edge_opt.export --device 0 --data $DATA/coco/coco.yaml --out $RUNS/models --variants onnx ul-int8 openvino openvino-int8 engine engine-int8 $ARRAY_ARGS"
+array = ["--weights $RUNS/models/yolo26n.pt", "--weights $RUNS/models/yolo26s.pt"]
+
+[jobs.ptq]
+description = "ONNX Runtime INT8 PTQ variants: head post-processing in float, class branch in float, three calibrations"
+partition = "CPUQ"
+gpus = 0
+constraint = ""
+time = "0-01:00:00"
+command = "python -m edge_opt.quantize --calib $DATA/coco/calib2017.txt --images 512 --exclude head-postprocess $ARRAY_ARGS"
+array = [
+    "--model $RUNS/models/yolo26n_fp32.onnx --method minmax --out $RUNS/models/yolo26n_int8-minmax.onnx",
+    "--model $RUNS/models/yolo26n_fp32.onnx --method minmax --float-groups 23/one2one_cv3 --out $RUNS/models/yolo26n_int8-cls-float-minmax.onnx",
+    "--model $RUNS/models/yolo26n_fp32.onnx --method percentile --float-groups 23/one2one_cv3 --out $RUNS/models/yolo26n_int8-cls-float-percentile.onnx",
+    "--model $RUNS/models/yolo26n_fp32.onnx --method entropy --float-groups 23/one2one_cv3 --out $RUNS/models/yolo26n_int8-cls-float-entropy.onnx",
+    "--model $RUNS/models/yolo26s_fp32.onnx --method minmax --out $RUNS/models/yolo26s_int8-minmax.onnx",
+    "--model $RUNS/models/yolo26s_fp32.onnx --method minmax --float-groups 23/one2one_cv3 --out $RUNS/models/yolo26s_int8-cls-float-minmax.onnx",
+    "--model $RUNS/models/yolo26s_fp32.onnx --method percentile --float-groups 23/one2one_cv3 --out $RUNS/models/yolo26s_int8-cls-float-percentile.onnx",
+    "--model $RUNS/models/yolo26s_fp32.onnx --method entropy --float-groups 23/one2one_cv3 --out $RUNS/models/yolo26s_int8-cls-float-entropy.onnx",
+]
+
+[jobs.sensitivity]
+description = "Leave-one-group-out INT8 sensitivity on 500 val images (YOLO26n, YOLO26s); resumes from sensitivity.json"
+partition = "CPUQ"
+gpus = 0
+constraint = ""
+cpus = 16
+time = "0-12:00:00"
+command = "python -m edge_opt.sensitivity --data $DATA/coco/coco.yaml --calib $DATA/coco/calib2017.txt --images 500 $ARRAY_ARGS"
+array = [
+    "--model $RUNS/models/yolo26n_fp32.onnx --out $RUNS/sensitivity/yolo26n",
+    "--model $RUNS/models/yolo26s_fp32.onnx --out $RUNS/sensitivity/yolo26s",
+]
+
+[jobs.accuracy]
+description = "COCO val2017 (5000 images, official COCO metric) for every CPU-runnable model"
+partition = "CPUQ"
+gpus = 0
+constraint = ""
+time = "0-06:00:00"
+command = "python -m edge_opt.evaluate --data $DATA/coco/coco.yaml --out $RUNS/accuracy --models $ARRAY_ARGS"
+array = [
+    "$RUNS/models/yolo26n.pt $RUNS/models/yolo26n_*.onnx $RUNS/models/yolo26n_*_openvino_model",
+    "$RUNS/models/yolo26s.pt $RUNS/models/yolo26s_*.onnx $RUNS/models/yolo26s_*_openvino_model",
+]
+
+[jobs.accuracy-gpu]
+description = "COCO val2017 for the TensorRT engines (must run on the GPU type they were built for)"
+time = "0-01:00:00"
+command = "python -m edge_opt.evaluate --data $DATA/coco/coco.yaml --out $RUNS/accuracy --device 0 --models $RUNS/models/*.engine"
+
+[jobs.latency-cpu]
+description = "ONNX Runtime and OpenVINO latency on a cluster CPU node, 1/4/8 threads"
+partition = "CPUQ"
+gpus = 0
+constraint = ""
+time = "0-02:00:00"
+command = "python -m edge_opt.latency --out $RUNS/latency --tag cluster-cpu --threads 1 4 8 $ARRAY_ARGS"
+array = [
+    "--runtime ort-cpu --models $RUNS/models/yolo26n_fp32.onnx $RUNS/models/yolo26n_*int8*.onnx $RUNS/models/yolo26s_fp32.onnx $RUNS/models/yolo26s_*int8*.onnx",
+    "--runtime openvino --models $RUNS/models/*_openvino_model",
+]
+
+[jobs.latency-gpu]
+description = "TensorRT engines (FP16, INT8) and the QAT Q/DQ models through ONNX Runtime's TensorRT provider"
+time = "0-01:00:00"
+command = "python -m edge_opt.latency --out $RUNS/latency --tag cluster-a100 $ARRAY_ARGS"
+array = [
+    "--runtime ultralytics --device 0 --models $RUNS/models/*.engine",
+    # TensorRT takes only symmetric INT8 scales: the QAT export (ModelOpt) qualifies, ONNX Runtime's asymmetric PTQ files do not
+    "--runtime ort-tensorrt --models $RUNS/models/yolo26n_fp32.onnx $RUNS/models/yolo26n_qat.onnx $RUNS/models/yolo26s_fp32.onnx $RUNS/models/yolo26s_qat.onnx",
+]
+
+[jobs.qat]
+description = "Quantization-aware training (Ultralytics + ModelOpt), 10 epochs of COCO train2017"
+time = "0-16:00:00"
+mem = "64G"
+cpus = 16
+constraint = "gpu40g|gpu80g"
+checkpoint_signal = true
+command = "python -m edge_opt.qat --data $DATA/coco/coco_full.yaml --epochs 10 --batch 64 --workers 14 --project $RUNS/qat $ARRAY_ARGS"
+array = ["--weights $RUNS/models/yolo26n.pt --name qat_yolo26n", "--weights $RUNS/models/yolo26s.pt --name qat_yolo26s"]
+
+[jobs.qat-float-control]
+description = "The same schedule without quantizers: what does extra fine-tuning alone change?"
+time = "0-12:00:00"
+mem = "64G"
+cpus = 16
+constraint = "gpu40g|gpu80g"
+checkpoint_signal = true
+command = "python -m edge_opt.qat --float --data $DATA/coco/coco_full.yaml --epochs 10 --batch 64 --workers 14 --project $RUNS/qat $ARRAY_ARGS"
+array = ["--weights $RUNS/models/yolo26n.pt --name ft_yolo26n", "--weights $RUNS/models/yolo26s.pt --name ft_yolo26s"]
+
+[jobs.export-qat]
+description = "QAT checkpoints to Q/DQ ONNX and TensorRT INT8 (ranges come from training, no calibration)"
+time = "0-01:00:00"
+command = "bash scripts/export_qat.sh"
+
+[jobs.summary]
+description = "Accuracy-latency tables and the Pareto plot"
+partition = "CPUQ"
+gpus = 0
+constraint = ""
+time = "0-00:15:00"
+cpus = 1
+mem = "4G"
+command = "python -m edge_opt.summary --accuracy $RUNS/accuracy --latency $RUNS/latency --sensitivity $RUNS/sensitivity --out $RUNS/summary"

@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "edge-optimization"
+version = "0.1.0"
+description = "YOLO26 on edge hardware: INT8 post-training quantization with layer sensitivity analysis, quantization-aware training, and the accuracy-latency trade-off across ONNX Runtime, OpenVINO, Core ML and TensorRT."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Kacper Pawlowski" }]
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "opencv-python-headless>=4.9",
+    "pyyaml>=6",
+    "requests>=2.31",
+    "matplotlib>=3.8",
+    "torch>=2.3",
+    "ultralytics>=8.4.170",
+    "onnx>=1.16",
+    "onnxslim>=0.1",
+    "faster-coco-eval>=1.6",
+]
+
+[project.optional-dependencies]
+# ONNX Runtime comes as two exclusive packages: the CPU build (laptop, CI) or the CUDA build (GPU cluster)
+# coremltools 9 fails with numpy >= 2.4 ("only 0-dimensional arrays can be converted to Python scalars")
+mac = ["onnxruntime>=1.20", "openvino>=2025.0", "nncf>=2.14", "coremltools>=8.0", "numpy<=2.3.5", "nvidia-modelopt>=0.44"]
+# ModelOpt: [onnx] for TensorRT engine export (Ultralytics routes FP16 and INT8 through it), huggingface_hub
+# because modelopt.torch imports it unconditionally (QAT)
+cuda = ["onnxruntime-gpu>=1.20", "tensorrt>=10.0", "openvino>=2025.0", "nncf>=2.14", "nvidia-modelopt[onnx]>=0.44", "huggingface_hub"]
+dev = ["onnxruntime>=1.20", "pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+edge-data = "edge_opt.data:main"
+edge-export = "edge_opt.export:main"
+edge-quantize = "edge_opt.quantize:main"
+edge-sensitivity = "edge_opt.sensitivity:main"
+edge-qat = "edge_opt.qat:main"
+edge-eval = "edge_opt.evaluate:main"
+edge-latency = "edge_opt.latency:main"
+edge-summary = "edge_opt.summary:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "NPY"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
